@@ -71,11 +71,11 @@ describe("applicableLaw — 분리시행(단계 시행일) 보정", () => {
 
     const r = await applicableLaw(client, { lawName: "소득세법", date: "2010-05-01" })
     const text = r.content[0].text
-    expect(text).toContain("[시행 2010.4.1.]")
+    expect(text).toContain("[시행 2010.04.01]")
     expect(text).toContain("(MST 131405)")
     expect(text).toContain("제9897호")
     expect(text).toContain("분리시행 보정")
-    expect(text).not.toContain("[시행 2010.3.10.]")
+    expect(text).not.toContain("[시행 2010.03.10]")
   })
 
   it("슬라이스 조회가 실패해도 lsHistory 결과로 진행한다 (보수적)", async () => {
@@ -93,7 +93,7 @@ describe("applicableLaw — 분리시행(단계 시행일) 보정", () => {
 
     const r = await applicableLaw(client, { lawName: "소득세법", date: "2010-05-01" })
     const text = r.content[0].text
-    expect(text).toContain("[시행 2010.3.10.]")
+    expect(text).toContain("[시행 2010.03.10]")
     expect(text).not.toContain("분리시행 보정")
   })
 })
@@ -119,9 +119,90 @@ describe("applicableLaw — 적용 버전 자신의 부칙 발췌 (laterVersions
 
     const r = await applicableLaw(client, { lawName: LAW, date: "2022-01-27" })
     const text = r.content[0].text
-    expect(text).toContain("[시행 2022.1.27.]")
+    expect(text).toContain("[시행 2022.01.27]")
     expect(text).toContain("적용례·경과조치 발췌")
     expect(text).toContain("50명 미만")
+  })
+
+  // 표기 통일: applicable_law만 "2022.1.27."(무패딩·후행점)을 썼고 나머지 도구는
+  // formatDateDot의 "2022.01.27"을 쓴다. 같은 날짜가 도구마다 달리 보이면
+  // 사용자가 그대로 재인용할 때 표기가 흔들린다.
+  it("날짜 표기가 코드베이스 표준(YYYY.MM.DD)을 따른다", async () => {
+    const LAW = "중대재해 처벌 등에 관한 법률"
+    const client = {
+      searchLaw: async () => searchXml(LAW, "228817"),
+      fetchApi: async (p: FetchApiParams) => {
+        if (p.target === "lsHistory") {
+          return histPage(1, [histRow(LAW, "228817", "20220127", "17907", "2021.01.26", "제정")])
+        }
+        if (p.target === "eflaw") return EFLAW_EMPTY_XML
+        if (p.target === "law") return JUNGDAEJAEHAE_ADDENDUM_JSON
+        throw new Error(`unexpected target: ${p.target}`)
+      },
+    } as unknown as LawApiClient
+
+    const r = await applicableLaw(client, { lawName: LAW, date: "2022-01-27" })
+    const text = r.content[0].text
+    expect(text).toContain("행위시법 판단: 중대재해 처벌 등에 관한 법률 @ 2022.01.27")
+    expect(text).toContain("부칙 <제17907호, 2021.01.26>")
+    // 한 자리 월·일에 0을 붙이지 않던 옛 표기가 남아 있으면 안 된다
+    expect(text).not.toMatch(/\d{4}\.\d\./)
+  })
+})
+
+describe("applicableLaw — 분리시행 슬라이스 보존 + 시행 예정 개정 경고", () => {
+  beforeEach(() => lawCache.clear())
+
+  // 회귀 (2026-08-19 형사소송법 실측): ① 같은 MST가 분리시행으로 두 행(이미 시행분 +
+  // 미래 시행분)일 때 MST 단독 dedup이 이미 시행분을 지워 "현행"이 직전 공포본으로
+  // 밀렸다. ② 시행 예정 대개정(제21857호, 2026.10.2.)의 존재를 응답 어디서도 알리지
+  // 않아 현행 인용만 보고 답하면 개정을 통째로 놓쳤다. 픽스처 날짜는 실행 시점
+  // 비의존이 되도록 미래분을 2099년으로 치환한 동형 구조.
+  it("이미 시행된 슬라이스가 현행으로 잡히고, 시행 예정 개정이 경고된다", async () => {
+    const client = {
+      searchLaw: async () => searchXml("형사소송법", "281865"),
+      fetchApi: async (p: FetchApiParams) => {
+        if (p.target === "lsHistory") {
+          return histPage(4, [
+            histRow("형사소송법", "281865", "20991231", "21241", "2025.12.30", "일부개정"),  // 미래 슬라이스 (같은 MST)
+            histRow("형사소송법", "288579", "20990102", "21857", "2026.08.04", "일부개정"),  // 시행 예정 개정
+            histRow("형사소송법", "281865", "20260701", "21241", "2025.12.30", "일부개정"),  // 이미 시행된 슬라이스
+            histRow("형사소송법", "280441", "20260624", "21100", "2025.12.23", "일부개정"),
+          ])
+        }
+        if (p.target === "eflaw") return EFLAW_EMPTY_XML
+        if (p.target === "law") return `{"법령":{"부칙":{"부칙단위":[]}}}`
+        throw new Error(`unexpected target: ${p.target}`)
+      },
+    } as unknown as LawApiClient
+
+    const r = await applicableLaw(client, { lawName: "형사소송법", date: "2026-08-19" })
+    const text = r.content[0].text
+    // ① 현행 = 이미 시행된 슬라이스 (MST 단독 dedup였으면 20260624판으로 밀림)
+    expect(text).toContain("[시행 2026.07.01]")
+    expect(text).toContain("(MST 281865)")
+    expect(text).not.toContain("[시행 2026.06.24]")
+    // ② 시행 예정 개정 경고 + 후속 조회 유도
+    expect(text).toContain("시행 예정 개정")
+    expect(text).toContain("제21857호")
+    expect(text).toContain('get_law_text(mst="288579")')
+  })
+
+  it("시행 예정 개정이 없으면 경고를 내지 않는다", async () => {
+    const client = {
+      searchLaw: async () => searchXml("형사소송법", "281865"),
+      fetchApi: async (p: FetchApiParams) => {
+        if (p.target === "lsHistory") {
+          return histPage(1, [histRow("형사소송법", "281865", "20260701", "21241", "2025.12.30", "일부개정")])
+        }
+        if (p.target === "eflaw") return EFLAW_EMPTY_XML
+        if (p.target === "law") return `{"법령":{"부칙":{"부칙단위":[]}}}`
+        throw new Error(`unexpected target: ${p.target}`)
+      },
+    } as unknown as LawApiClient
+
+    const r = await applicableLaw(client, { lawName: "형사소송법", date: "2026-08-19" })
+    expect(r.content[0].text).not.toContain("시행 예정 개정")
   })
 })
 
@@ -149,5 +230,33 @@ describe("applicableLaw — 조문 응답 정직성 (jo 검증)", () => {
     const text = r.content[0].text
     expect(text).toContain("[NOT_FOUND] 해당 버전에서 제44조를 찾지 못했습니다")
     expect(text).not.toContain("제1조(목적)")
+  })
+})
+
+// 2026-09-23 리뷰 B#11: 슬라이스 조회의 catch 가 예산 소진까지 삼켜, 분리시행 보정을 건너뛴 옛 공포본을
+// "기준일 시행 버전"으로 확신 출력했다. 예산 소진·취소는 오류로 올린다(그 밖의 실패는 종전대로 보정 생략).
+describe("applicableLaw: 예산 소진을 '보정 없음'으로 삼키지 않는다 (B#11)", () => {
+  beforeEach(() => lawCache.clear())
+
+  it("분리시행 슬라이스 조회가 예산 소진이면 보정 전 버전을 확신 출력하지 않는다", async () => {
+    const { ExecutionLimitError } = await import("../lib/execution-limits.js")
+    const client = {
+      searchLaw: async () => searchXml("소득세법", "94269"),
+      fetchApi: async (p: FetchApiParams) => {
+        if (p.target === "lsHistory") {
+          return histPage(2, [
+            histRow("소득세법", "94269", "20100310", "9763", "2009.06.09", "타법개정"),
+            histRow("소득세법", "98343", "20100101", "9924", "2010.01.01", "타법개정"),
+          ])
+        }
+        if (p.target === "eflaw") throw new ExecutionLimitError("Request upstream work budget exceeded (max 48 attempts).")
+        if (p.target === "law") return `{"법령":{"부칙":{"부칙단위":[]}}}`
+        throw new Error(`unexpected target: ${p.target}`)
+      },
+    } as unknown as LawApiClient
+
+    const r = await applicableLaw(client, { lawName: "소득세법", date: "2010-05-01" })
+    expect(r.isError).toBe(true)
+    expect(r.content[0].text).not.toContain("[시행 2010.03.10]")
   })
 })

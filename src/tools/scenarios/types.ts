@@ -4,6 +4,14 @@
  */
 import type { LawApiClient } from "../../lib/api-client.js"
 import type { LooseToolResponse } from "../../lib/types.js"
+import type { ScenarioName } from "../../lib/scenario-rules.js"
+
+/**
+ * 시나리오가 응답에 이미 싣는 자원.
+ * 체인은 이 선언을 읽고 같은 것을 중복 조회하지 않는다 — 체인 쪽에 시나리오 이름을
+ * 하드코딩하면 별표를 싣는 새 시나리오가 생길 때마다 중복이 되살아난다(#131).
+ */
+export type ScenarioResource = "annex"
 
 /** 시나리오 실행 결과: 추가 섹션 + 후속 액션 제안 */
 export interface ScenarioResult {
@@ -36,17 +44,11 @@ export interface ScenarioContext {
   extras?: Record<string, unknown>
 }
 
-/** 지원하는 시나리오 목록 */
-export type ScenarioType =
-  | "penalty"       // chain_action_basis: 처분·벌칙 기준 종합
-  | "customs"       // chain_full_research: 관세·통관 종합
-  | "manual"        // chain_procedure_detail: 공무원 처리 매뉴얼
-  | "delegation"    // chain_law_system: 위임입법 미이행 감시
-  | "impact"        // chain_law_system: 법령 개정 영향도
-  | "timeline"      // chain_amendment_track: 시계열 타임라인 (판례·해석례 매핑)
-  | "time_travel"   // chain_amendment_track: 두 시점 본문 자동 diff (v4.0)
-  | "compliance"    // chain_ordinance_compare: 상위법 적합성
-  | "action_plan"   // chain_full_research: 시민 친화 step-by-step 가이드 (v4.0)
+/**
+ * 지원하는 시나리오 목록.
+ * 이름·소속 체인·감지 어휘의 원본은 lib/scenario-rules.ts 하나다 (#101).
+ */
+export type ScenarioType = ScenarioName
 
 /** callTool 래퍼 — 체인과 동일 시그니처 */
 export async function callTool(
@@ -60,6 +62,25 @@ export async function callTool(
     return { text: result.content?.[0]?.text || "", isError: !!result.isError }
   } catch (e) {
     return { text: `오류: ${e instanceof Error ? e.message : String(e)}`, isError: true }
+  }
+}
+
+/**
+ * 조회 결과 하나를 섹션으로 싣는다 (2026-09-23 리뷰 B#9).
+ * 0건([NOT_FOUND])·빈 결과는 종전대로 싣지 않되, 조회 실패는 isError 섹션으로 남긴다. 종전엔 실패도
+ * 조용히 빠졌는데, 별표를 싣는 시나리오(PROVIDES annex)가 붙으면 체인이 제 별표 조회를 건너뛰므로
+ * 시나리오의 별표 실패가 흔적 없이 사라졌다.
+ */
+export function pushResultSection(
+  sections: ScenarioSection[],
+  title: string,
+  result: { text: string; isError: boolean } | null
+): void {
+  if (!result) return
+  if (!result.isError && result.text.trim()) {
+    sections.push({ title, content: result.text })
+  } else if (result.isError && !/\[NOT_FOUND\]/.test(result.text)) {
+    sections.push({ title, content: result.text || "원인 미상", isError: true })
   }
 }
 

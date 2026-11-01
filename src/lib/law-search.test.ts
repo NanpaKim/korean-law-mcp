@@ -65,6 +65,31 @@ describe("resolvedLawMatches — laws[0] 맹신 방지 가드", () => {
   })
 })
 
+// 유일한 살아있는 소비자는 verify-citations.verifyOne(법령 후보 확정)이다.
+// 그 경로가 기대는 동작을 여기서 고정한다 — 예전엔 verify-citations가 재수출한 심볼을
+// 테스트가 붙잡고 있어서, 소비자가 사라져도 재수출이 죽지 않았다 (#135).
+describe("looseMatchLawName — verify_citations 후보 확정이 기대는 동작", () => {
+  it("공백 무시 완전 일치", () => {
+    expect(looseMatchLawName("형법", "형법")).toBe(true)
+  })
+
+  it("공식 법령명이 후보로 시작하면 매칭 (약칭)", () => {
+    expect(looseMatchLawName("개인정보", "개인정보 보호법")).toBe(true)
+  })
+
+  it("법률/법 접미 정규화로 매칭", () => {
+    expect(looseMatchLawName("국가공무원법", "국가공무원법")).toBe(true)
+  })
+
+  it("수식어가 남은 후보는 매칭 실패 (조문검증 저하 방지 대상)", () => {
+    expect(looseMatchLawName("절도죄는 형법", "형법")).toBe(false)
+  })
+
+  it("전혀 다른 법령은 매칭 실패", () => {
+    expect(looseMatchLawName("형법", "민법")).toBe(false)
+  })
+})
+
 describe("looseMatchLawName (lib 승격 후 동작 유지)", () => {
   it("공백 무시·접두 허용", () => {
     expect(looseMatchLawName("자본시장과 금융투자업에 관한 법률", "자본시장과금융투자업에관한법률")).toBe(true)
@@ -87,5 +112,20 @@ describe("looseMatchLawName (lib 승격 후 동작 유지)", () => {
 
   it("가운뎃점 포함 법령명도 resolvedLawMatches 가드를 통과한다", () => {
     expect(resolvedLawMatches("식품 등의 표시·광고에 관한 법률", "식품 등의 표시ㆍ광고에 관한 법률")).toBe(true)
+  })
+})
+
+describe("findLaws — 단계 캐시 배열을 제자리 정렬하지 않는다 (2026-09-28 리뷰)", () => {
+  it("폐지 단계 검색어로 모인 결과를 정렬해도 캐시의 업스트림 순서는 그대로다", async () => {
+    lawCache.clear()
+    const rows = ["건축법 시행령", "건축법"]
+    const client = {
+      searchLaw: async (q: string) => q === "건축법"
+        ? `<LawSearch>${rows.map((n, i) => `<law id="${i}"><법령일련번호>${i}</법령일련번호><법령명한글><![CDATA[${n}]]></법령명한글><법령ID>${i}</법령ID></law>`).join("")}</LawSearch>`
+        : `<LawSearch></LawSearch>`,
+    } as unknown as LawApiClient
+    const ranked = await findLaws(client, "건축법 허가", undefined, 5)
+    expect(ranked[0].lawName).toBe("건축법")   // 관련도 정렬은 된다
+    expect(lawCache.get<Array<{ lawName: string }>>("law-search-raw:건축법:100")?.map(r => r.lawName)).toEqual(rows)
   })
 })

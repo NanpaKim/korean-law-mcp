@@ -22,6 +22,8 @@ import {
   chainProcedureDetail, chainProcedureDetailSchema,
   chainDocumentReview,
 } from "./chains.js"
+import { throwIfRequestCancelled } from "../lib/session-state.js"
+import { truncateResponse } from "../lib/schemas.js"
 
 const TASK_VALUES = new Set([
   "full_research", "law_system", "action_basis", "dispute_prep",
@@ -54,7 +56,9 @@ export const LegalResearchSchema = z.preprocess((raw) => {
   }
   return o
 }, z.object({
-  query: z.string().optional()
+  // 노출 진입점이라 여기서 막지 않으면 무제한 텍스트가 체인 스키마를 우회해
+  // routeQuery 로 그대로 들어간다 — chains.ts 의 MAX_CHAIN_QUERY 와 같은 상한(#121)
+  query: z.string().max(2000).optional()
     .describe("자연어 질문/법령명/키워드 (예: '음주운전 처벌 기준', '관세법 체계'). document_review 외 모든 task에서 필수"),
   task: z.enum([
     "full_research", "law_system", "action_basis", "dispute_prep",
@@ -78,6 +82,8 @@ export const LegalResearchSchema = z.preprocess((raw) => {
     .describe("[time_travel] 비교 시작 시점 YYYYMMDD"),
   toDate: z.string().regex(/^\d{8}$/).optional()
     .describe("[time_travel] 비교 종료 시점 YYYYMMDD"),
+  includeHistory: z.boolean().optional()
+    .describe("[amendment_track] 조문별 개정 이력(제정 시점부터 전건)까지 포함. 기본 false — 이 섹션이 응답 상한을 먼저 소진해 신구대조표가 잘린다 (#158)"),
   text: z.string().optional()
     .describe("[document_review 전용·필수] 검토할 계약서/약관 전문 텍스트"),
   maxClauses: z.number().min(1).max(30).optional()
@@ -109,10 +115,18 @@ export function pickScenario<S extends z.ZodType>(
   }
 }
 
-/** 경고 노트를 응답 첫 줄에 주입 */
+/**
+ * 경고 노트를 응답 첫 줄에 주입.
+ *
+ * 노트를 별도 블록으로 얹으면 내부 도구가 이미 상한까지 채운 응답이 노트 길이만큼
+ * 상한을 넘는다(#145). 첫 블록에 합쳐 넣고 다시 상한을 적용해, 넘치는 쪽이 본문이
+ * 되게 한다 — 잘려 나가야 할 것은 경고가 아니라 뒤쪽 본문이다.
+ */
 export function withNote(note: string | undefined, res: ToolResponse): ToolResponse {
   if (!note) return res
-  return { ...res, content: [{ type: "text", text: note }, ...res.content] }
+  const [first, ...rest] = res.content
+  const merged = first?.text ? `${note}\n${first.text}` : note
+  return { ...res, content: [{ type: "text", text: truncateResponse(merged) }, ...rest] }
 }
 
 /** scenario 필드가 없는 task에 scenario가 들어온 경우의 경고 */
@@ -126,6 +140,7 @@ export async function legalResearch(
   apiClient: LawApiClient,
   input: LegalResearchInput
 ): Promise<ToolResponse> {
+  throwIfRequestCancelled()
   const task = input.task ?? "full_research"
 
   if (task === "document_review") {
@@ -159,7 +174,8 @@ export async function legalResearch(
       const { value: scenario, note } = pickScenario(chainAmendmentTrackSchema.shape.scenario, input.scenario, task)
       return withNote(note, await chainAmendmentTrack(apiClient, {
         query, mst: input.mst, lawId: input.lawId, scenario,
-        fromDate: input.fromDate, toDate: input.toDate, apiKey,
+        fromDate: input.fromDate, toDate: input.toDate,
+        includeHistory: input.includeHistory ?? false, apiKey,
       }))
     }
     case "ordinance_compare": {

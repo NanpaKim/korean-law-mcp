@@ -13,17 +13,18 @@
 import { z } from "zod"
 import { DOMParser } from "@xmldom/xmldom"
 import type { LawApiClient } from "../lib/api-client.js"
-import { truncateResponse } from "../lib/schemas.js"
+import { dateSchema, truncateResponse } from "../lib/schemas.js"
 import { formatToolError } from "../lib/errors.js"
 import { toArray, parseSearchXML, extractTag } from "../lib/xml-parser.js"
 import { normalizeAliasKey, resolveLawAlias } from "../lib/search-normalizer.js"
 import { resolvedLawMatches } from "../lib/law-search.js"
+import { rethrowIfFatal } from "../lib/fatal-errors.js"
 
 export const OrdinanceRadarSchema = z.object({
-  ordinSeq: z.string().optional().describe("자치법규 일련번호 (search_ordinance 결과의 [번호])"),
+  ordinSeq: z.string().optional().describe("자치법규 일련번호 (ordinSeq)"),
   id: z.string().optional().describe("ordinSeq 별칭 — 힌트가 id=로 안내하는 경우 대응"),
   ordinanceName: z.string().optional().describe("자치법규명 — 지정 시 검색 후 첫 결과 사용 (예: '서울특별시 광진구 주차장 설치 및 관리 조례')"),
-  query: z.string().optional().describe("ordinanceName 별칭 — 자연어 조례명으로 검색 (search_law 등 다른 도구와 규약 통일)"),
+  query: z.string().optional().describe("ordinanceName 별칭 — 자연어 조례명으로 검색"),
   apiKey: z.string().optional().describe("법제처 Open API 인증키(OC). 사용자가 제공한 경우 전달"),
 }).refine(d => d.ordinSeq || d.id || d.ordinanceName || d.query, {
   message: "ordinSeq(또는 별칭 id)·ordinanceName·query 중 하나는 필수입니다",
@@ -64,20 +65,22 @@ function extractBasisLaws(purposeText: string, selfName: string): string[] {
   }
 
   let baseLaw = ""
-  const re = /「([^」]+)」/g
+  const re = /「([^「」]+)」|같은\s*법\s*(시행령|시행규칙)(?:\s*(?:및|[·ㆍ,])\s*(시행령|시행규칙))?/g
   let m: RegExpExecArray | null
   while ((m = re.exec(purposeText)) !== null) {
+    if (!m[1]) {
+      if (baseLaw) {
+        push(`${baseLaw} ${m[2]}`)
+        if (m[3]) push(`${baseLaw} ${m[3]}`)
+      }
+      continue
+    }
     const name = m[1].trim()
     if (!/(법|법률|시행령|시행규칙|규정)$/.test(name)) continue
     if (normalizeAliasKey(name) === selfKey) continue
-    if (/(법|법률)$/.test(name) && !baseLaw) baseLaw = name // 첫 법률을 "같은 법"의 지시대상으로
+    const base = name.replace(/\s*(시행령|시행규칙)$/, "")
+    if (/(법|법률)$/.test(base)) baseLaw = base
     push(name)
-  }
-
-  // 「」 밖의 "같은 법 시행령/시행규칙" 파생 (base 법률이 있을 때만)
-  if (baseLaw) {
-    if (/시행령/.test(purposeText)) push(`${baseLaw} 시행령`)
-    if (/시행규칙/.test(purposeText)) push(`${baseLaw} 시행규칙`)
   }
   return result
 }
@@ -171,7 +174,7 @@ export async function ordinanceRadar(
     const statuses = await Promise.all(
       parentNames.map(async (name) => {
         try { return await fetchLawStatus(apiClient, name, input.apiKey) }
-        catch { return null }
+        catch (error) { rethrowIfFatal(error); return null }
       })
     )
 
@@ -185,9 +188,15 @@ export async function ordinanceRadar(
 
     let needReview = 0
     let unknown = 0
+    const validOrdDate = dateSchema.safeParse(ordEff).success
     for (let i = 0; i < parentNames.length; i++) {
       const s = statuses[i]
-      if (!s || !s.effDate) {
+      if (!validOrdDate) {
+        unknown++
+        out += `  ❓ ${parentNames[i]} — 조례 시행일 확인 불가 (시행일 선후 비교 미확인)\n`
+        continue
+      }
+      if (!s || !dateSchema.safeParse(s.effDate).success) {
         unknown++
         out += `  ❓ ${parentNames[i]} — 현행 시행일 확인 불가 (search_law로 개별 확인 권장)\n`
         continue
@@ -205,9 +214,13 @@ export async function ordinanceRadar(
     out += `\n📋 요약: `
     if (needReview > 0) {
       out += `근거 상위법 ${parentNames.length}건 중 ${needReview}건이 조례 시행 이후 개정됨 → 정비 검토 대상.\n`
-      out += `개정 내용이 조례 위임사항과 관련되는지 확인 권장 — get_law_text(mst=...)로 개정 조문을, compare_law로 신구 대조를 확인하세요.\n`
+      out += `개정 내용이 조례 위임사항과 관련되는지 확인 권장 — get_law_text(mst=...)로 개정 조문을, execute_tool(tool_name="compare_old_new", params={mst:"…"})로 신구 대조를 확인하세요.\n`
+    } else if (!validOrdDate) {
+      out += `조례 시행일을 확인하지 못해 상위법과의 시행일 선후 비교를 할 수 없습니다. 조례 본문에서 시행일을 확인하세요.\n`
     } else if (unknown === parentNames.length) {
       out += `상위법 현행 시행일을 확인하지 못했습니다. 개별 search_law로 확인하세요.\n`
+    } else if (unknown > 0) {
+      out += `${unknown}건은 시행일 비교를 확인하지 못했습니다. 확인된 나머지 상위법은 조례 시행 시점까지 반영된 것으로 보입니다 (개정 시행일 기준).\n`
     } else {
       out += `근거 상위법이 조례 시행 시점까지 반영된 것으로 보입니다 (개정 시행일 기준).\n`
     }
